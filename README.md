@@ -18,7 +18,7 @@
   - `area` 在指定区域里游走
 - **点击切窗口**：左键点某个小人，前置它绑定的那个窗口（可在 `config.json` 里按标题关键字绑定）
 - **设置面板**：右键 → 设置，可调运动模式、速度、大小、数量、帧率（10–60 FPS）、开机自启动
-- **可打包成 exe**：`dist/ClawdAgents.exe` 拿到别的电脑上直接双击就能跑
+- **可打包成 exe**：不装 Python 的电脑可直接下载 [Releases](https://github.com/bietou123/clawd-agents/releases) 里的 `ClawdAgents.exe` 双击运行
 
 ## 运行
 
@@ -28,7 +28,7 @@
 python clawd_agents.py
 ```
 
-也可以直接用打包好的 `dist/ClawdAgents.exe`。
+不装 Python 的话，直接下 [Releases](https://github.com/bietou123/clawd-agents/releases) 里的 `ClawdAgents.exe` 双击运行。
 
 ## 操作
 
