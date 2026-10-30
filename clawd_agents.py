@@ -56,6 +56,24 @@ PARTS = {
     "leg_4": (8.13, 7.6, 1.35, 2.0),
 }
 
+
+def part_group(name: str) -> str:
+    """同色又共顶边的图元合成一个多边形：每少一个图元，每帧就少一次 GDI 重画。"""
+    if name.startswith("eye"):
+        return "eyes"
+    if name.startswith("leg_"):
+        return "legs"
+    return name
+
+
+def comb_points(rects: list[tuple[float, float, float, float]]) -> list[float]:
+    """顶端齐平的若干矩形拼成一个梳齿多边形；齿间连线落在同一条顶边上，高度为零不会多填一块。"""
+    rects.sort()
+    pts: list[float] = []
+    for x0, y0, x1, y1 in rects:
+        pts += [x0, y0, x0, y1, x1, y1, x1, y0]
+    return pts
+
 # (动作, 权重, 时长范围)
 STATES = [
     ("walk", 6.0, (2.5, 6.0)),
@@ -414,16 +432,15 @@ class Agent:
         self.clipped = False
         self.rotated = False
         self.fill: dict[int, str] = {}
+        self.geom: dict[int, tuple] = {}
 
         self.poly = {}
         for name in PARTS:
-            if name.startswith("eye"):
-                color = EYE
-            elif name.startswith("arm") or name.startswith("leg"):
-                color = LIMB
-            else:
-                color = BODY
-            self.poly[name] = canvas.create_polygon(
+            group = part_group(name)
+            if group in self.poly:
+                continue
+            color = {"eyes": EYE, "arm_l": LIMB, "arm_r": LIMB, "legs": LIMB}.get(group, BODY)
+            self.poly[group] = canvas.create_polygon(
                 0, 0, 0, 0, 0, 0, 0, 0, fill=color, outline="", tags=("clawd", f"a{index}")
             )
 
@@ -490,20 +507,28 @@ class Agent:
         dx, dy = x - cx, y - cy
         return cx + dx * ca - dy * sa, cy + dx * sa + dy * ca
 
-    def _quad(self, item, x0, y0, x1, y1, cx, cy, rot, color=None) -> None:
+    def _poly(self, item, pts, cx, cy, rot, color=None) -> None:
         if color is not None:
             self._show(item, True)
             if self.fill.get(item) != color:
                 self.fill[item] = color
                 self.canvas.itemconfig(item, fill=color)
         if rot:
-            a = self._rot(x0, y0, cx, cy, rot)
-            b = self._rot(x1, y0, cx, cy, rot)
-            d = self._rot(x1, y1, cx, cy, rot)
-            e = self._rot(x0, y1, cx, cy, rot)
-            self.canvas.coords(item, a[0], a[1], b[0], b[1], d[0], d[1], e[0], e[1])
-        else:
-            self.canvas.coords(item, x0, y0, x1, y0, x1, y1, x0, y1)
+            turned: list[float] = []
+            for i in range(0, len(pts), 2):
+                rx, ry = self._rot(pts[i], pts[i + 1], cx, cy, rot)
+                turned += [rx, ry]
+            pts = turned
+        # 落在同一个整数像素上就不用重画：走路时每帧只挪半个像素，
+        # 白白重画这一块既费 GDI 又让整层透明窗口重新合成一次
+        key = tuple(round(v) for v in pts)
+        if self.geom.get(item) == key:
+            return
+        self.geom[item] = key
+        self.canvas.coords(item, *pts)
+
+    def _quad(self, item, x0, y0, x1, y1, cx, cy, rot, color=None) -> None:
+        self._poly(item, (x0, y0, x1, y0, x1, y1, x0, y1), cx, cy, rot, color)
 
     def update(self, cx: float, cy: float, t: float, cut: float | None = None) -> None:
         self.pos = (cx, cy)
@@ -536,6 +561,7 @@ class Agent:
         ox = cx - 6.0 * u
         oy = cy - 5.0 * u
 
+        groups: dict[str, list[tuple[float, float, float, float]]] = {}
         for name, (gx, gy, gw, gh) in PARTS.items():
             dy = bob
             if name == "arm_l":
@@ -555,16 +581,21 @@ class Agent:
 
             x0 = ox + (gx + sway / u) * u
             y0 = oy + gy * u + dy
-            item = self.poly[name]
             if cut is not None:
                 if y0 >= cut:
-                    self._show(item, False)
                     continue
-                bottom = min(y0 + gh * u, cut)
-                self._show(item, True)
-                self._quad(item, x0, y0, x0 + gw * u, bottom, cx, cy, rot)
+                y1 = min(y0 + gh * u, cut)
             else:
-                self._quad(item, x0, y0, x0 + gw * u, y0 + gh * u, cx, cy, rot)
+                y1 = y0 + gh * u
+            groups.setdefault(part_group(name), []).append((x0, y0, x0 + gw * u, y1))
+
+        for group, item in self.poly.items():
+            rects = groups.get(group)
+            if not rects:
+                self._show(item, False)
+                continue
+            self._show(item, True)
+            self._poly(item, comb_points(rects), cx, cy, rot)
 
         self._extras(p, local, ox, oy, u, s, bob, cx, cy, rot, cut)
         if rot and not self.rotated:
