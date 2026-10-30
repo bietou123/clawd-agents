@@ -406,6 +406,8 @@ class Agent:
 
         self.visible = True
         self.clipped = False
+        self.rotated = False
+        self.fill: dict[int, str] = {}
 
         self.poly = {}
         for name in PARTS:
@@ -432,6 +434,9 @@ class Agent:
             )
             for _ in range(3)
         ]
+        self.shown: dict[int, bool] = {item: True for item in self.poly.values()}
+        for item in [self.prop, self.bubble] + self.dots:
+            self.shown[item] = False
 
     def set_size(self, size: int) -> None:
         self.size = size
@@ -444,11 +449,18 @@ class Agent:
             return
         self.visible = on
         for item in self.poly.values():
-            self.canvas.itemconfig(item, state="normal" if on else "hidden")
+            self._show(item, on)
         if not on:
             self.clipped = False
+            self.rotated = False
             for item in [self.prop, self.bubble] + self.dots:
-                self.canvas.itemconfig(item, state="hidden")
+                self._show(item, False)
+
+    def _show(self, item, on: bool) -> None:
+        if self.shown.get(item) is on:
+            return
+        self.shown[item] = on
+        self.canvas.itemconfig(item, state="normal" if on else "hidden")
 
     def destroy(self) -> None:
         for item in self.items():
@@ -473,8 +485,11 @@ class Agent:
         return cx + dx * ca - dy * sa, cy + dx * sa + dy * ca
 
     def _quad(self, item, x0, y0, x1, y1, cx, cy, rot, color=None) -> None:
-        if color:
-            self.canvas.itemconfig(item, state="normal", fill=color)
+        if color is not None:
+            self._show(item, True)
+            if self.fill.get(item) != color:
+                self.fill[item] = color
+                self.canvas.itemconfig(item, fill=color)
         if rot:
             a = self._rot(x0, y0, cx, cy, rot)
             b = self._rot(x1, y0, cx, cy, rot)
@@ -492,7 +507,7 @@ class Agent:
         if cut is None:
             if self.clipped:
                 for item in self.poly.values():
-                    self.canvas.itemconfig(item, state="normal")
+                    self._show(item, True)
                 self.clipped = False
         else:
             self.clipped = True
@@ -537,25 +552,26 @@ class Agent:
             item = self.poly[name]
             if cut is not None:
                 if y0 >= cut:
-                    self.canvas.itemconfig(item, state="hidden")
+                    self._show(item, False)
                     continue
                 bottom = min(y0 + gh * u, cut)
-                self.canvas.itemconfig(item, state="normal")
+                self._show(item, True)
                 self._quad(item, x0, y0, x0 + gw * u, bottom, cx, cy, rot)
             else:
                 self._quad(item, x0, y0, x0 + gw * u, y0 + gh * u, cx, cy, rot)
 
         self._extras(p, local, ox, oy, u, s, bob, cx, cy, rot, cut)
-        if rot:
+        if rot and not self.rotated:
             self.canvas.tag_raise(f"a{self.index}")
+        self.rotated = bool(rot)
 
     def _extras(self, p, local, ox, oy, u, s, bob, cx, cy, rot, cut=None) -> None:
         c = self.canvas
         if cut is not None:
-            c.itemconfig(self.prop, state="hidden")
-            c.itemconfig(self.bubble, state="hidden")
+            self._show(self.prop, False)
+            self._show(self.bubble, False)
             for item in self.dots:
-                c.itemconfig(item, state="hidden")
+                self._show(item, False)
             return
         kind = p["prop"]
 
@@ -568,7 +584,7 @@ class Agent:
             py = oy - 2.6 * u + bob
             self._quad(self.prop, px, py, px + 4.2 * u, py + 3.2 * u, cx, cy, rot, PAPER)
         else:
-            c.itemconfig(self.prop, state="hidden")
+            self._show(self.prop, False)
 
         if kind == "bubble":
             bx = ox + 8.0 * u
@@ -582,7 +598,7 @@ class Agent:
                 if lit:
                     self._quad(item, qx, qy, qx + d, qy + d, cx, cy, rot, DOT)
                 else:
-                    c.itemconfig(item, state="hidden")
+                    self._show(item, False)
         elif p["zzz"]:
             for k, item in enumerate(self.dots):
                 phase = (local * 0.7 + k * 0.33) % 1.0
@@ -591,9 +607,9 @@ class Agent:
                 qy = oy - 1.0 * u - phase * 3.4 * u + bob
                 self._quad(item, qx, qy, qx + size, qy + size, cx, cy, rot, DOT)
         else:
-            c.itemconfig(self.bubble, state="hidden")
+            self._show(self.bubble, False)
             for item in self.dots:
-                c.itemconfig(item, state="hidden")
+                self._show(item, False)
 
     def hit(self, x: float, y: float) -> bool:
         if not self.visible:
@@ -637,6 +653,8 @@ class App:
 
         self.t_epoch = time.perf_counter()
         self.frame_ms = self.fps_ms()
+        self.frame_period = self.fps_period()
+        self.next_ms = 0.0
 
         self.canvas.bind("<Button-1>", self.on_click)
         self.canvas.bind("<Button-3>", self.on_right)
@@ -667,6 +685,10 @@ class App:
     def fps_ms(self) -> int:
         fps = max(10, min(60, int(self.cfg.get("fps", 30))))
         return max(16, round(1000 / fps))
+
+    def fps_period(self) -> float:
+        fps = max(10, min(60, int(self.cfg.get("fps", 30))))
+        return 1000.0 / fps
 
     # ---------- 窗口范围 ----------
     #
@@ -908,6 +930,18 @@ class App:
         y = base_y + px * 0.11 * math.sin(t * 1.6 * speed + i)
         return x, y
 
+    def schedule(self) -> None:
+        """按绝对时间轴排下一帧；after() 的毫秒取整误差累积起来会掉到 56 帧。"""
+        now = time.perf_counter() * 1000.0
+        if self.next_ms <= 0.0:
+            self.next_ms = now
+        self.next_ms += self.frame_period
+        lag = self.next_ms - now
+        if lag < -3.0 * self.frame_period:
+            self.next_ms = now + self.frame_period
+            lag = self.frame_period
+        self.root.after(max(1, int(round(lag))), self.tick)
+
     def tick(self) -> None:
         t = time.perf_counter() - self.t_epoch
         dt = min(0.06, max(0.0, t - self.last_t))
@@ -924,7 +958,7 @@ class App:
                 agent.set_visible(visible)
                 crop = cut - self.win_y if cut is not None else None
                 agent.update(cx - self.win_x, cy - self.win_y, t, crop)
-            self.root.after(self.frame_ms, self.tick)
+            self.schedule()
             return
 
         speed = float(self.cfg["speed"])
@@ -935,7 +969,7 @@ class App:
             cx, cy = self.position(i, t)
             agent.set_visible(True)
             agent.update(cx - self.win_x, cy - self.win_y, t)
-        self.root.after(self.frame_ms, self.tick)
+        self.schedule()
 
     # ---------- 交互 ----------
 
@@ -1082,6 +1116,8 @@ class App:
     def on_fps(self) -> None:
         self.cfg["fps"] = int(self.fps_var.get())
         self.frame_ms = self.fps_ms()
+        self.frame_period = self.fps_period()
+        self.next_ms = 0.0
         self.fps_label.set(f"帧率  {self.cfg['fps']} FPS")
         self.save_config()
 
