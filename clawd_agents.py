@@ -846,6 +846,7 @@ class App:
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
 
         self.settings = None
+        self.pick = None
         self.tray = Tray()
         self.tick()
 
@@ -1267,6 +1268,16 @@ class App:
                 font=font, anchor="w", command=self.on_mode,
             ).pack(fill="x", padx=26)
 
+        tk.Button(
+            win, text="框选活动区域…", command=self.pick_area,
+            bg="#3a2d26", fg=label_fg, relief="flat", font=font,
+            activebackground="#4a3a31", activeforeground=label_fg,
+        ).pack(fill="x", padx=26, pady=(6, 0))
+        self.area_label = tk.Label(
+            win, text=self.area_text(), wraplength=250, justify="left", **common,
+        )
+        self.area_label.pack(fill="x", padx=26)
+
         self.speed_var = tk.DoubleVar(value=self.cfg["speed"])
         row("速度")
         tk.Scale(
@@ -1314,7 +1325,90 @@ class App:
             bg="#3a2d26", fg=label_fg, relief="flat", font=font,
         ).pack(fill="x", padx=14, pady=14)
 
-        win.geometry(f"280x660+{self.screen_w - 320}+60")
+        win.geometry(f"280x790+{self.screen_w - 320}+60")
+
+    def area_text(self) -> str:
+        ax, ay, aw, ah = self.cfg["area"]
+        text = f"当前区域  左 {ax:.0%}   上 {ay:.0%}\n宽 {aw:.0%}   高 {ah:.0%}"
+        if self.cfg["mode"] != "area":
+            text += "\n切到「指定区域」后生效"
+        return text
+
+    def pick_area(self) -> None:
+        """盖一层半透明蒙版，直接拖个框当活动区域，比手改 config.json 里的比例靠谱。"""
+        if self.pick and self.pick.winfo_exists():
+            self.pick.lift()
+            return
+
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.geometry(f"{self.screen_w}x{self.screen_h}+0+0")
+        win.attributes("-topmost", True)
+        win.attributes("-alpha", 0.35)
+        self.pick = win
+
+        cv = tk.Canvas(win, bg="#000000", highlightthickness=0, bd=0, cursor="crosshair")
+        cv.pack(fill="both", expand=True)
+        cv.create_text(
+            self.screen_w / 2, self.screen_h * 0.08,
+            text="拖动框选小人的活动区域    ·    Esc 取消",
+            fill="#f2e4d8", font=tkfont.Font(family="Microsoft YaHei UI", size=14),
+        )
+
+        start: list[float] = []
+
+        def press(event: tk.Event) -> None:
+            start[:] = [event.x, event.y]
+            cv.delete("sel")
+            cv.create_rectangle(
+                event.x, event.y, event.x, event.y,
+                outline="#d97757", width=3, tags="sel",
+            )
+
+        def drag(event: tk.Event) -> None:
+            if start:
+                cv.coords("sel", start[0], start[1], event.x, event.y)
+
+        def release(event: tk.Event) -> None:
+            if not start:
+                return
+            x0, y0 = start[0], start[1]
+            start.clear()
+            left, right = sorted((x0, event.x))
+            top, bottom = sorted((y0, event.y))
+            px = int(self.cfg["size"]) * self.scale
+            if right - left < px * 2 or bottom - top < px * 2:
+                close()  # 框太小，直接当没选
+                return
+            self.cfg["area"] = [
+                round(left / self.screen_w, 4),
+                round(top / self.screen_h, 4),
+                round((right - left) / self.screen_w, 4),
+                round((bottom - top) / self.screen_h, 4),
+            ]
+            self.cfg["mode"] = "area"
+            if getattr(self, "mode_var", None) is not None:
+                self.mode_var.set("area")
+            self.save_config()
+            self.update_window_geometry()
+            if getattr(self, "area_label", None) is not None:
+                try:
+                    self.area_label.configure(text=self.area_text())
+                except tk.TclError:
+                    pass
+            close()
+
+        def close(_event: tk.Event | None = None) -> None:
+            self.pick = None
+            win.destroy()
+
+        cv.bind("<Button-1>", press)
+        cv.bind("<B1-Motion>", drag)
+        cv.bind("<ButtonRelease-1>", release)
+        cv.bind("<Button-3>", close)
+        win.bind("<Escape>", close)
+        win.lift()
+        win.focus_force()
 
     def on_mode(self) -> None:
         self.cfg["mode"] = self.mode_var.get()
@@ -1325,6 +1419,8 @@ class App:
         else:
             for agent in self.agents:
                 agent.set_visible(True)
+        if getattr(self, "area_label", None) is not None:
+            self.area_label.configure(text=self.area_text())
         self.save_config()
 
     def on_speed(self) -> None:
