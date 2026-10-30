@@ -116,6 +116,13 @@ def cursor_pos() -> tuple[int, int]:
     return pt.x, pt.y
 
 
+def body_gap(x: float, y: float, half: float, rect: tuple[int, int, int, int]) -> float:
+    """以 (x, y) 为中心的小人身体到窗口矩形的间隙，负数表示压进去多深。"""
+    dx = max(rect[0] - (x + half), (x - half) - rect[2])
+    dy = max(rect[1] - (y + half), (y - half) - rect[3])
+    return max(dx, dy)
+
+
 def dpi_scale() -> float:
     hdc = user32.GetDC(None)
     dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88)
@@ -399,7 +406,6 @@ class Agent:
         self.rspeed = 0.0
         self.rest_until = 0.0
         self.hide_until = 0.0
-        self.was_hidden = False
         self.peek_until = 0.0
         self.peek_x = 0.0
         self.peek_top = None
@@ -746,7 +752,7 @@ class App:
             agent.rspeed = 0.0
             agent.rest_until = 0.0
             agent.hide_until = 0.0
-            agent.was_hidden = False
+            agent.peek_until = 0.0
             agent.peek_until = 0.0
             agent.peek_top = None
             agent.set_visible(True)
@@ -780,38 +786,26 @@ class App:
             self.peek_owner = None
             self.peek_cool = t + random.uniform(3.5, 7.0)
 
+    def blocking_rects(self) -> list[tuple[int, int, int, int]]:
+        """能藏人的窗口：顶到屏幕上沿的窗口没法探头，当作不存在。"""
+        px = int(self.cfg["size"]) * self.scale
+        return [rect for rect in self.rects if rect[1] >= px * 1.4]
+
     def free_point(self, margin: float) -> tuple[float, float]:
-        """尽量挑一个不在窗口底下的落脚点，别让小人一直闷在窗口后面。"""
-        fallback = (self.screen_w / 2, self.screen_h / 2)
-        for _ in range(14):
+        """挑一个身体不和任何窗口重叠的落脚点；实在没有就挑最空的那个。"""
+        px = int(self.cfg["size"]) * self.scale
+        half = px * 0.4
+        blocked = self.blocking_rects()
+        best, best_gap = (self.screen_w / 2, self.screen_h / 2), -1e18
+        for _ in range(16):
             x = random.uniform(margin, max(margin + 1, self.screen_w - margin))
             y = random.uniform(margin, max(margin + 1, self.screen_h - margin))
-            fallback = (x, y)
-            for rect in self.rects:
-                if rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]:
-                    break
-            else:
+            gap = min((body_gap(x, y, half, rect) for rect in blocked), default=1e9)
+            if gap > 0:
                 return x, y
-        return fallback
-
-    def exit_point(self, cx: float, cy: float, rect: tuple[int, int, int, int], margin: float) -> tuple[float, float]:
-        """从窗口里钻出来时最近的窗口外落点；只考虑落在屏幕里的那几条边。"""
-        l, tp, r, b = rect
-        cands = [
-            (cy - tp, cx, tp - margin),
-            (b - cy, cx, b + margin),
-            (cx - l, l - margin, cy),
-            (r - cx, r + margin, cy),
-        ]
-        cands.sort(key=lambda c: c[0])
-        for _, x, y in cands:
-            if margin <= x <= self.screen_w - margin and margin <= y <= self.screen_h - margin:
-                return x, y
-        _, x, y = cands[0]
-        return (
-            min(max(margin, x), max(margin + 1, self.screen_w - margin)),
-            min(max(margin, y), max(margin + 1, self.screen_h - margin)),
-        )
+            if gap > best_gap:
+                best, best_gap = (x, y), gap
+        return best
 
     def roam(self, agent: Agent, t: float, dt: float) -> tuple[float, float, float | None, bool]:
         """捉迷藏：自由乱跑，撞进窗口就隐身，偶尔从窗口上沿探头，鼠标一靠近就逃。"""
@@ -870,31 +864,30 @@ class App:
         agent.spos = (cx, cy)
 
         # EnumWindows 是自上而下的 Z 序：第一个命中的就是盖在最上面的那个窗口，
-        # 只趴它的边，避免趴在被别的窗口挡住的那条边上（看起来像趴在窗口里面）
+        # 只趴它的边，避免趴在被别的窗口挡住的那条边上（看起来像趴在窗口里面）。
+        # 判定用整个身体而不是中心点：中心点在边界上来回踱两三像素时，
+        # 中心点判定会让小人一帧隐一帧现，看起来就是闪。
+        half = px * 0.4
         inside = None
         for rect in self.rects:
-            if not (rect[0] <= cx <= rect[2] and rect[1] <= cy <= rect[3]):
-                continue
             if rect[1] < px * 1.4:
                 # 顶到屏幕顶的窗口无从探头，直接穿过，别让小人凭空消失
                 continue
-            inside = rect
-            break
+            if body_gap(cx, cy, half, rect) < 0:
+                inside = rect
+                break
 
         if inside is None:
+            if t < agent.hide_until:
+                # 刚钻进去就又从窗口边上走出来了：多藏一会儿再露面，否则看着像闪
+                return cx, cy, None, False
             agent.hide_until = 0.0
-            if agent.was_hidden:
-                agent.was_hidden = False
-                agent.rt = None
-                agent.rest_until = t + random.uniform(0.2, 0.8)
             return cx, cy, None, True
 
         if not agent.hide_until:
             agent.hide_until = t + random.uniform(0.4, 1.2)
-            agent.was_hidden = True
-            agent.rt = self.exit_point(cx, cy, inside, margin)
-            agent.rspeed = max(agent.rspeed, px * 2.6 * speed_mul)
-            return cx, cy, None, False
+            # 隐身的这段时间反正看不见，走快点，别让人等太久才从窗口另一边出来
+            agent.rspeed = max(agent.rspeed, px * 3.0 * speed_mul)
 
         can_peek = self.peek_owner is None and t >= self.peek_cool
         if can_peek and t >= agent.hide_until and random.random() < dt * 1.5:
