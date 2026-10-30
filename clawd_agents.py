@@ -35,7 +35,7 @@ else:
 CONFIG_PATH = os.path.join(HERE, "config.json")
 
 DEFAULT_CONFIG = {
-    "mode": "hide",
+    "mode": "right",
     "count": 7,
     "size": 36,
     "speed": 1.0,
@@ -132,6 +132,150 @@ def cursor_pos() -> tuple[int, int]:
     pt = wintypes.POINT()
     user32.GetCursorPos(ctypes.byref(pt))
     return pt.x, pt.y
+
+
+WM_TRAY = 0x8001
+NIM_ADD, NIM_DELETE = 0, 2
+NIF_MESSAGE, NIF_ICON, NIF_TIP = 0x1, 0x2, 0x4
+WM_LBUTTONUP, WM_RBUTTONUP, WM_CONTEXTMENU = 0x0202, 0x0205, 0x007B
+GWLP_WNDPROC = -4
+
+
+class GUID(ctypes.Structure):
+    _fields_ = [
+        ("Data1", wintypes.DWORD), ("Data2", wintypes.WORD),
+        ("Data3", wintypes.WORD), ("Data4", ctypes.c_ubyte * 8),
+    ]
+
+
+class NOTIFYICONDATAW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD), ("hWnd", wintypes.HWND),
+        ("uID", wintypes.UINT), ("uFlags", wintypes.UINT),
+        ("uCallbackMessage", wintypes.UINT), ("hIcon", wintypes.HICON),
+        ("szTip", wintypes.WCHAR * 128), ("dwState", wintypes.DWORD),
+        ("dwStateMask", wintypes.DWORD), ("szInfo", wintypes.WCHAR * 256),
+        ("uVersion", wintypes.UINT), ("szInfoTitle", wintypes.WCHAR * 64),
+        ("dwInfoFlags", wintypes.DWORD), ("guidItem", GUID),
+        ("hBalloonIcon", wintypes.HICON),
+    ]
+
+
+class ICONINFO(ctypes.Structure):
+    _fields_ = [
+        ("fIcon", wintypes.BOOL), ("xHotspot", wintypes.DWORD),
+        ("yHotspot", wintypes.DWORD), ("hbmMask", wintypes.HBITMAP),
+        ("hbmColor", wintypes.HBITMAP),
+    ]
+
+
+def clawd_icon() -> int:
+    """画一个 32x32 的通知区图标：橙色方块配两只眼睛。"""
+    gdi32 = ctypes.windll.gdi32
+    size = 32
+    body = [0x57, 0x77, 0xD9, 0xFF]  # BGRA，即 #d97757
+    eye = [0x10, 0x14, 0x19, 0xFF]  # #191410
+    rows = []
+    for y in range(size - 1, -1, -1):  # DIB 是自下而上的
+        row = []
+        for x in range(size):
+            if 11 <= y < 17 and (10 <= x < 14 or 18 <= x < 22):
+                row += eye
+            elif 5 <= y < 27 and 4 <= x < 28:
+                row += body
+            else:
+                row += [0, 0, 0, 0]
+        rows += row
+    buf = (ctypes.c_ubyte * len(rows))(*rows)
+    color = gdi32.CreateBitmap(size, size, 1, 32, buf)
+    mask = gdi32.CreateBitmap(size, size, 1, 1, None)
+    if not color or not mask:
+        return 0
+    info = ICONINFO(1, 0, 0, mask, color)
+    icon = user32.CreateIconIndirect(ctypes.byref(info))
+    gdi32.DeleteObject(color)
+    gdi32.DeleteObject(mask)
+    return icon
+
+
+class Tray:
+    """通知区图标。透明窗口的空白处对鼠标是穿透的，没有它只能去点会逃跑的小人。"""
+
+    def __init__(self) -> None:
+        self.pending = False
+        self.hwnd = None
+        self.icon = 0
+        self.old = None
+        self._proc = None
+        try:
+            kernel32 = ctypes.windll.kernel32
+            user32.CreateWindowExW.restype = wintypes.HWND
+            self.hwnd = user32.CreateWindowExW(
+                0, "STATIC", "Clawd Agents", 0, 0, 0, 0, 0,
+                None, None, kernel32.GetModuleHandleW(None), None,
+            )
+            if not self.hwnd:
+                return
+            self._proc = ctypes.WINFUNCTYPE(
+                ctypes.c_ssize_t, wintypes.HWND, ctypes.c_uint,
+                wintypes.WPARAM, wintypes.LPARAM,
+            )(self._wndproc)
+            user32.SetWindowLongPtrW.restype = ctypes.c_void_p
+            user32.SetWindowLongPtrW.argtypes = [
+                wintypes.HWND, ctypes.c_int, ctypes.c_void_p,
+            ]
+            self.old = user32.SetWindowLongPtrW(self.hwnd, GWLP_WNDPROC, self._proc)
+            user32.CallWindowProcW.restype = ctypes.c_ssize_t
+            user32.CallWindowProcW.argtypes = [
+                ctypes.c_void_p, wintypes.HWND, ctypes.c_uint,
+                wintypes.WPARAM, wintypes.LPARAM,
+            ]
+            self.icon = clawd_icon()
+            shell32 = ctypes.windll.shell32
+            shell32.Shell_NotifyIconW.argtypes = [
+                wintypes.DWORD, ctypes.POINTER(NOTIFYICONDATAW),
+            ]
+            shell32.Shell_NotifyIconW.restype = wintypes.BOOL
+            data = NOTIFYICONDATAW()
+            data.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
+            data.hWnd = self.hwnd
+            data.uID = 1
+            data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
+            data.uCallbackMessage = WM_TRAY
+            data.hIcon = self.icon
+            data.szTip = "Clawd Agents —— 右键打开菜单"
+            shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(data))
+        except Exception:
+            self.hwnd = None
+
+    def _wndproc(self, hwnd, msg, wparam, lparam) -> int:
+        try:
+            if msg == WM_TRAY:
+                if lparam & 0xFFFF in (WM_RBUTTONUP, WM_LBUTTONUP, WM_CONTEXTMENU):
+                    self.pending = True
+                return 0
+            return user32.CallWindowProcW(self.old, hwnd, msg, wparam, lparam)
+        except Exception:
+            return 0
+
+    def remove(self) -> None:
+        if not self.hwnd:
+            return
+        try:
+            data = NOTIFYICONDATAW()
+            data.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
+            data.hWnd = self.hwnd
+            data.uID = 1
+            ctypes.windll.shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(data))
+            if self.old:
+                user32.SetWindowLongPtrW(self.hwnd, GWLP_WNDPROC, self.old)
+            user32.DestroyWindow(self.hwnd)
+            if self.icon:
+                user32.DestroyIcon(self.icon)
+        except Exception:
+            pass
+        self.hwnd = None
+
 
 
 def body_gap(x: float, y: float, half: float, rect: tuple[int, int, int, int]) -> float:
@@ -422,8 +566,12 @@ class Agent:
         self.spos = (0.0, 0.0)
         self.rt = None
         self.rspeed = 0.0
+        self.goal_speed = 0.0
+        self.inside = None
         self.rest_until = 0.0
         self.hide_until = 0.0
+        self.hidden_since = 0.0
+        self.over = None
         self.peek_until = 0.0
         self.peek_x = 0.0
         self.peek_top = None
@@ -698,6 +846,7 @@ class App:
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
 
         self.settings = None
+        self.tray = Tray()
         self.tick()
 
     # ---------- 配置 ----------
@@ -781,9 +930,12 @@ class App:
             )
             agent.rt = None
             agent.rspeed = 0.0
+            agent.goal_speed = 0.0
+            agent.inside = None
             agent.rest_until = 0.0
             agent.hide_until = 0.0
-            agent.peek_until = 0.0
+            agent.hidden_since = 0.0
+            agent.over = None
             agent.peek_until = 0.0
             agent.peek_top = None
             agent.set_visible(True)
@@ -812,15 +964,38 @@ class App:
         agent.peek_until = 0.0
         agent.peek_top = None
         agent.rt = None
+        agent.goal_speed = 0.0
         agent.rest_until = t + 0.2
         if self.peek_owner == agent.index:
             self.peek_owner = None
             self.peek_cool = t + random.uniform(3.5, 7.0)
 
     def blocking_rects(self) -> list[tuple[int, int, int, int]]:
-        """能藏人的窗口：顶到屏幕上沿的窗口没法探头，当作不存在。"""
+        """能藏人的窗口：盖满整屏的窗口躲进去就再也出不来，只能当作可以走的地面。"""
+        w, h = self.screen_w, self.screen_h
+        return [
+            rect for rect in self.rects
+            if rect[2] - rect[0] < w * 0.97 or rect[3] - rect[1] < h * 0.97
+        ]
+
+    def covers_screen(self, rect: tuple[int, int, int, int]) -> bool:
+        """窗口盖住了屏幕一大半：躲进去基本走不出来，只能藏一会儿就爬回表面。"""
+        area = (rect[2] - rect[0]) * (rect[3] - rect[1])
+        return area >= self.screen_w * self.screen_h * 0.75
+
+    def near_point(self, cx: float, cy: float, margin: float) -> tuple[float, float]:
+        """在脚边挑个落脚点：距离控制在一到五个身位，看起来是散步，不是满屏乱弹。"""
         px = int(self.cfg["size"]) * self.scale
-        return [rect for rect in self.rects if rect[1] >= px * 1.4]
+        half = px * 0.4
+        blocked = self.blocking_rects()
+        for _ in range(12):
+            dist = random.uniform(px * 1.2, px * 5.0)
+            ang = random.uniform(0.0, math.tau)
+            x = min(max(margin, cx + math.cos(ang) * dist), max(margin + 1, self.screen_w - margin))
+            y = min(max(margin, cy + math.sin(ang) * dist), max(margin + 1, self.screen_h - margin))
+            if min((body_gap(x, y, half, rect) for rect in blocked), default=1e9) > 0:
+                return x, y
+        return self.free_point(margin)
 
     def free_point(self, margin: float) -> tuple[float, float]:
         """挑一个身体不和任何窗口重叠的落脚点；实在没有就挑最空的那个。"""
@@ -872,22 +1047,28 @@ class App:
                 min(max(margin, cy + fdy / d * run), max(margin + 1, self.screen_h - margin)),
             )
             agent.rspeed = px * 3.4 * speed_mul
+            agent.goal_speed = px * 3.4 * speed_mul
             agent.rest_until = 0.0
         elif agent.rt is None and t >= agent.rest_until:
-            agent.rt = self.free_point(margin)
-            roll = random.random()
-            burst = 1.9 if roll < 0.2 else 0.5 if roll < 0.5 else 1.0
-            agent.rspeed = random.uniform(30, 58) * (px / 45.0) * speed_mul * burst
+            agent.rt = self.near_point(cx, cy, margin)
+            agent.goal_speed = random.uniform(34, 50) * (px / 45.0) * speed_mul
+
+        agent.rspeed += (agent.goal_speed - agent.rspeed) * min(1.0, dt * 4.0)
 
         if agent.rt is not None:
             tx, ty = agent.rt
             dx, dy = tx - cx, ty - cy
             dist = math.hypot(dx, dy)
-            step = agent.rspeed * dt
+            speed_now = agent.rspeed
+            if agent.inside is not None and agent.over != agent.inside:
+                # 隐身期间反正看不见，走快些，别让人等太久才从窗口另一边出来
+                speed_now = max(speed_now, px * 2.7 * speed_mul)
+            step = speed_now * dt
             if dist <= step or dist < 1.0:
                 cx, cy = tx, ty
                 agent.rt = None
-                agent.rest_until = t + random.uniform(0.3, 2.0)
+                agent.goal_speed = 0.0
+                agent.rest_until = t + random.uniform(0.8, 2.6)
             else:
                 cx += dx / dist * step
                 cy += dy / dist * step
@@ -900,27 +1081,40 @@ class App:
         # 中心点判定会让小人一帧隐一帧现，看起来就是闪。
         half = px * 0.4
         inside = None
-        for rect in self.rects:
-            if rect[1] < px * 1.4:
-                # 顶到屏幕顶的窗口无从探头，直接穿过，别让小人凭空消失
-                continue
+        for rect in self.blocking_rects():
             if body_gap(cx, cy, half, rect) < 0:
                 inside = rect
                 break
+        agent.inside = inside
 
         if inside is None:
+            agent.over = None
+            agent.hidden_since = 0.0
             if t < agent.hide_until:
                 # 刚钻进去就又从窗口边上走出来了：多藏一会儿再露面，否则看着像闪
                 return cx, cy, None, False
             agent.hide_until = 0.0
             return cx, cy, None, True
 
+        if agent.over == inside:
+            # 已经从这扇窗口里爬回表面了，等身体整个离开它再重新躲
+            return cx, cy, None, True
+
         if not agent.hide_until:
             agent.hide_until = t + random.uniform(0.4, 1.2)
-            # 隐身的这段时间反正看不见，走快点，别让人等太久才从窗口另一边出来
-            agent.rspeed = max(agent.rspeed, px * 3.0 * speed_mul)
+            agent.hidden_since = t
+        elif self.covers_screen(inside) and t - agent.hidden_since > 3.0:
+            # 盖住大半屏幕的窗口（最大化那种），从边上根本走不出去：
+            # 藏 3 秒就当它从窗口里爬了出来，先在上面走，离开这扇窗口再重新藏
+            agent.over = inside
+            agent.hide_until = 0.0
+            agent.hidden_since = 0.0
+            return cx, cy, None, True
 
-        can_peek = self.peek_owner is None and t >= self.peek_cool
+        # 顶到屏幕上沿的窗口没法探头：脑袋会伸到屏幕外面去，只能老老实实躲着
+        can_peek = (
+            self.peek_owner is None and t >= self.peek_cool and inside[1] >= px * 1.4
+        )
         if can_peek and t >= agent.hide_until and random.random() < dt * 1.5:
             self.peek_owner = agent.index
             agent.rt = None
@@ -972,6 +1166,10 @@ class App:
         self.last_t = t
         mode = self.cfg["mode"]
 
+        if self.tray.pending:
+            self.tray.pending = False
+            self.open_menu_at_cursor()
+
         if mode == "hide":
             if t >= self.rect_t:
                 self.rects = window_rects()
@@ -1017,11 +1215,18 @@ class App:
             focus_window(windows[index]["hwnd"])
 
     def on_right(self, event: tk.Event) -> None:
+        self.open_menu(event.x_root, event.y_root)
+
+    def open_menu_at_cursor(self) -> None:
+        x, y = cursor_pos()
+        self.open_menu(x, y)
+
+    def open_menu(self, x: int, y: int) -> None:
         menu = tk.Menu(self.root, tearoff=0)
         menu.add_command(label="设置", command=self.open_settings)
         menu.add_separator()
         menu.add_command(label="退出", command=self.quit)
-        menu.tk_popup(event.x_root, event.y_root)
+        menu.tk_popup(x, y)
 
     # ---------- 设置面板 ----------
 
@@ -1050,8 +1255,8 @@ class App:
         row("运动模式")
         self.mode_var = tk.StringVar(value=self.cfg["mode"])
         for value, text in [
-            ("hide", "捉迷藏（躲到窗口后面）"),
             ("right", "贴着屏幕右边"),
+            ("hide", "捉迷藏（躲到窗口后面）"),
             ("orbit", "绕屏幕一圈"),
             ("area", "在指定区域游走"),
         ]:
@@ -1152,6 +1357,7 @@ class App:
 
     def quit(self) -> None:
         self.save_config()
+        self.tray.remove()
         try:
             ctypes.windll.winmm.timeEndPeriod(1)
         except Exception:
