@@ -37,6 +37,9 @@ CONFIG_PATH = os.path.join(HERE, "config.json")
 DEFAULT_CONFIG = {
     "mode": "right",
     "count": 7,
+    "auto_count": True,
+    "agent_processes": ["claude.exe", "codex.exe"],
+    "max_count": 20,
     "size": 36,
     "speed": 1.0,
     "fps": 45,
@@ -290,6 +293,81 @@ def dpi_scale() -> float:
     dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88)
     user32.ReleaseDC(None, hdc)
     return dpi / 96.0 if dpi else 1.0
+
+
+TH32CS_SNAPPROCESS = 0x00000002
+INVALID_HANDLE = ctypes.c_void_p(-1).value
+
+
+class PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", wintypes.DWORD),
+        ("cntUsage", wintypes.DWORD),
+        ("th32ProcessID", wintypes.DWORD),
+        ("th32DefaultHeapID", ctypes.c_size_t),
+        ("th32ModuleID", wintypes.DWORD),
+        ("cntThreads", wintypes.DWORD),
+        ("th32ParentProcessID", wintypes.DWORD),
+        ("pcPriClassBase", ctypes.c_long),
+        ("dwFlags", wintypes.DWORD),
+        ("szExeFile", ctypes.c_wchar * 260),
+    ]
+
+
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+kernel32.Process32FirstW.restype = wintypes.BOOL
+kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+kernel32.Process32NextW.restype = wintypes.BOOL
+kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+
+def running_agent_count(exes: tuple[str, ...]) -> int:
+    """正在运行的 agent 会话数。
+
+    一个 Codex 会话会拉起好几个 exe（主进程、sandbox、code-mode-host），
+    直接数进程会翻几倍。这里按进程树归并：父进程本身是 agent 的算同一条链，
+    同一个父进程下同名的多个进程（Codex 桌面版的守护进程）也只算一个。
+    """
+    want = {name.lower() for name in exes if name}
+    if not want:
+        return 0
+
+    snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if not snap or snap == INVALID_HANDLE:
+        return 0
+
+    entries: list[tuple[int, int, str]] = []
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        if kernel32.Process32FirstW(snap, ctypes.byref(entry)):
+            while True:
+                entries.append((
+                    int(entry.th32ProcessID),
+                    int(entry.th32ParentProcessID),
+                    entry.szExeFile.lower(),
+                ))
+                if not kernel32.Process32NextW(snap, ctypes.byref(entry)):
+                    break
+    finally:
+        kernel32.CloseHandle(snap)
+
+    agents = [row for row in entries if row[2] in want]
+    agent_pids = {pid for pid, _, _ in agents}
+    seen: set[tuple[int, str]] = set()
+    count = 0
+    for _, ppid, name in agents:
+        if ppid in agent_pids:  # 同一条进程树里的子进程，归到根上
+            continue
+        key = (ppid, name)
+        if key in seen:
+            continue
+        seen.add(key)
+        count += 1
+    return count
 
 
 def list_windows() -> list[dict]:
@@ -826,7 +904,10 @@ class App:
         self.win_w, self.win_h = self.screen_w, self.screen_h
         self.update_window_geometry()
 
+        self.detected_agents = 0
+        self.count_t = 0.0
         self.agents: list[Agent] = []
+        self.refresh_agent_count()
         self.build_agents()
 
         self.rects: list[tuple[int, int, int, int]] = []
@@ -869,6 +950,23 @@ class App:
         except Exception:
             pass
 
+    def agent_processes(self) -> tuple[str, ...]:
+        exes = self.cfg.get("agent_processes") or DEFAULT_CONFIG["agent_processes"]
+        return tuple(str(name).strip() for name in exes if str(name).strip())
+
+    def max_count(self) -> int:
+        return max(1, min(32, int(self.cfg.get("max_count", 20))))
+
+    def refresh_agent_count(self) -> None:
+        try:
+            self.detected_agents = running_agent_count(self.agent_processes())
+        except Exception:
+            pass  # 查不到就沿用上一次的结果，别把小人全收走
+
+    def target_count(self) -> int:
+        n = self.detected_agents if self.cfg.get("auto_count") else int(self.cfg["count"])
+        return max(1, min(self.max_count(), n))
+
     def fps_ms(self) -> int:
         fps = max(10, min(60, int(self.cfg.get("fps", 30))))
         return max(16, round(1000 / fps))
@@ -910,10 +1008,30 @@ class App:
         for agent in self.agents:
             agent.destroy()
         self.agents = [
-            Agent(self.canvas, i) for i in range(int(self.cfg["count"]))
+            Agent(self.canvas, i) for i in range(self.target_count())
         ]
         self.apply_size()
         self.reset_roam()
+
+    def sync_agent_count(self, n: int) -> None:
+        """运行中的 agent 数变了：只从尾部增减，不让已有的小人全体瞬移。"""
+        n = max(1, min(self.max_count(), int(n)))
+        if n == len(self.agents):
+            return
+        if n < len(self.agents):
+            for agent in self.agents[n:]:
+                agent.destroy()
+            del self.agents[n:]
+            if self.peek_owner is not None and self.peek_owner >= n:
+                self.peek_owner = None
+                self.peek_cool = 0.0
+            return
+        px = int(self.cfg["size"]) * self.scale
+        for i in range(len(self.agents), n):
+            agent = Agent(self.canvas, i)
+            agent.set_size(px)
+            self.init_agent_roam(agent)
+            self.agents.append(agent)
 
     def apply_size(self) -> None:
         px = int(int(self.cfg["size"]) * self.scale)
@@ -921,25 +1039,28 @@ class App:
             agent.set_size(px)
 
     def reset_roam(self) -> None:
-        px = int(self.cfg["size"]) * self.scale
         self.peek_owner = None
         self.peek_cool = 0.0
         for agent in self.agents:
-            agent.spos = (
-                random.uniform(px, max(px + 1, self.screen_w - px)),
-                random.uniform(px, max(px + 1, self.screen_h - px)),
-            )
-            agent.rt = None
-            agent.rspeed = 0.0
-            agent.goal_speed = 0.0
-            agent.inside = None
-            agent.rest_until = 0.0
-            agent.hide_until = 0.0
-            agent.hidden_since = 0.0
-            agent.over = None
-            agent.peek_until = 0.0
-            agent.peek_top = None
-            agent.set_visible(True)
+            self.init_agent_roam(agent)
+
+    def init_agent_roam(self, agent: Agent) -> None:
+        px = int(self.cfg["size"]) * self.scale
+        agent.spos = (
+            random.uniform(px, max(px + 1, self.screen_w - px)),
+            random.uniform(px, max(px + 1, self.screen_h - px)),
+        )
+        agent.rt = None
+        agent.rspeed = 0.0
+        agent.goal_speed = 0.0
+        agent.inside = None
+        agent.rest_until = 0.0
+        agent.hide_until = 0.0
+        agent.hidden_since = 0.0
+        agent.over = None
+        agent.peek_until = 0.0
+        agent.peek_top = None
+        agent.set_visible(True)
 
     # ---------- 运动 ----------
 
@@ -1167,6 +1288,14 @@ class App:
         self.last_t = t
         mode = self.cfg["mode"]
 
+        if self.cfg.get("auto_count") and t >= self.count_t:
+            self.count_t = t + 2.0
+            before = self.detected_agents
+            self.refresh_agent_count()
+            if self.detected_agents != before:
+                self.sync_agent_count(self.detected_agents)
+                self.refresh_count_text()
+
         if self.tray.pending:
             self.tray.pending = False
             self.open_menu_at_cursor()
@@ -1296,11 +1425,25 @@ class App:
 
         self.count_var = tk.IntVar(value=int(self.cfg["count"]))
         row("数量")
-        tk.Scale(
-            win, from_=1, to=12, resolution=1, orient="horizontal",
+        self.auto_count_var = tk.BooleanVar(value=bool(self.cfg.get("auto_count", True)))
+        tk.Checkbutton(
+            win, text="跟随正在运行的 agent 数量", variable=self.auto_count_var,
+            bg="#1d1815", fg=label_fg, selectcolor="#3a2d26",
+            activebackground="#1d1815", activeforeground=label_fg,
+            font=font, anchor="w", command=self.on_auto_count,
+        ).pack(fill="x", padx=26)
+        self.count_scale = tk.Scale(
+            win, from_=1, to=self.max_count(), resolution=1, orient="horizontal",
             variable=self.count_var, bg="#1d1815", fg=label_fg, highlightthickness=0,
             troughcolor="#3a2d26", font=font, command=lambda _: self.on_count(),
-        ).pack(fill="x", padx=14)
+        )
+        self.count_scale.pack(fill="x", padx=14)
+        if self.cfg.get("auto_count"):
+            self.count_scale.configure(state="disabled")
+        self.count_label = tk.StringVar(value=self.count_text())
+        tk.Label(
+            win, textvariable=self.count_label, wraplength=250, justify="left", **common,
+        ).pack(fill="x", padx=26)
 
         self.fps_var = tk.IntVar(value=int(self.cfg["fps"]))
         self.fps_label = tk.StringVar(value=f"帧率  {int(self.cfg['fps'])} FPS")
@@ -1325,7 +1468,7 @@ class App:
             bg="#3a2d26", fg=label_fg, relief="flat", font=font,
         ).pack(fill="x", padx=14, pady=14)
 
-        win.geometry(f"280x790+{self.screen_w - 320}+60")
+        win.geometry(f"280x830+{self.screen_w - 320}+60")
 
     def area_text(self) -> str:
         ax, ay, aw, ah = self.cfg["area"]
@@ -1433,9 +1576,38 @@ class App:
         self.update_window_geometry()
         self.save_config()
 
+    def count_text(self) -> str:
+        if self.cfg.get("auto_count"):
+            return f"检测到 {self.detected_agents} 个正在运行的 agent（至少保留 1 个）"
+        return f"手动固定 {int(self.cfg['count'])} 个"
+
+    def refresh_count_text(self) -> None:
+        label = getattr(self, "count_label", None)
+        if label is None:
+            return
+        try:
+            label.set(self.count_text())
+        except tk.TclError:
+            pass
+
+    def on_auto_count(self) -> None:
+        self.cfg["auto_count"] = bool(self.auto_count_var.get())
+        if self.cfg["auto_count"]:
+            self.count_scale.configure(state="disabled")
+            self.refresh_agent_count()
+            self.sync_agent_count(self.detected_agents)
+            self.count_t = 0.0
+        else:
+            self.count_scale.configure(state="normal")
+            self.sync_agent_count(int(self.cfg["count"]))
+        self.refresh_count_text()
+        self.save_config()
+
     def on_count(self) -> None:
         self.cfg["count"] = int(self.count_var.get())
-        self.build_agents()
+        if not self.cfg.get("auto_count"):
+            self.sync_agent_count(self.cfg["count"])
+        self.refresh_count_text()
         self.save_config()
 
     def on_fps(self) -> None:
